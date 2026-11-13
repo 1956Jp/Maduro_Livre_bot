@@ -1,0 +1,17 @@
+# Credenciales: nunca versionar
+.env
+
+# Entorno y caches
+venv/
+.venv/
+pyTelegramBotAPI/
+__pycache__/
+*.pyc
+
+# Registros (las URLs de Telegram llevan el token; ya no se loguean, por si acaso)
+bot.log
+nohup.out
+*.log
+
+# Documentacion interna del agente (historial de incidentes) — no publica
+AGENTS.md
