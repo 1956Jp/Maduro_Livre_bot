@@ -10,14 +10,17 @@ analisis de exactamente 5 lineas, acompanado de una imagen de Nicolas Maduro.
 La configuracion se lee del entorno (o de un archivo .env local); las
 constantes de abajo solo actuan como respaldo.
 """
+import asyncio
 import html
 import json
 import logging
 import os
 import random
 import re
+import sqlite3
 import time
 import unicodedata
+from datetime import datetime, timedelta
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -153,6 +156,7 @@ if CONTEXTO:
     SYSTEM_PROMPT += "\n\nINFORMACION Y TONO A CONSIDERAR:\n" + CONTEXTO
 
 memoria = {}
+BOT_APP = None           # referencia a la Application para las tareas de recordatorios
 MAX_HISTORIAL = 20          # mensajes guardados por usuario (10 pares)
 TELEGRAM_LIMIT = 4096       # limite de caracteres por mensaje de Telegram
 CAPTION_LIMIT = 1024        # limite de caracteres de pie de foto
@@ -642,6 +646,243 @@ async def descargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== fin EL MORRAL DIGITAL ====================
 
 
+# ==================== RECORDATORIOS (con prediccion de Lex) ====================
+# Recordatorios persistentes en SQLite. El formato clasico se parsea sin IA;
+# si el usuario escribe en lenguaje libre, Lex (LLM) interpreta la peticion y
+# "predice" el asunto y los minutos que faltan.
+RECORDATORIOS_DB = os.path.join(
+    os.path.expanduser("~"), ".local", "share", "maduro_bot", "recordatorios.db"
+)
+_RECORDARIO_TASKS = {}          # (chat_id, num) -> asyncio.Task
+UNIDADES_REM = {
+    "min": 1, "mins": 1, "minuto": 1, "minutos": 1,
+    "hora": 60, "horas": 60,
+    "dia": 1440, "dias": 1440, "día": 1440, "días": 1440,
+}
+REC_MIN_MINUTOS = 1
+REC_MAX_MINUTOS = 60 * 24 * 60  # 60 dias
+LEX_RECORDAR_SYSTEM = (
+    "Eres un extractor de recordatorios. De la peticion del usuario devuelves "
+    "SOLO un objeto JSON valido, sin explicaciones ni markdown, con exactamente "
+    "dos claves:\n"
+    '{"texto": <asunto breve del recordatorio, sin la fecha ni la hora>,\n'
+    ' "minutos": <entero de minutos que faltan desde el momento actual>}\n'
+    "Si la peticion no incluye cuando, usa 30 minutos. Si no puedes extraer "
+    "un asunto, usa la misma peticion abreviada como texto."
+)
+
+LEX_RECORDAR_EXTRA = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _rec_con() -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(RECORDATORIOS_DB), exist_ok=True)
+    con = sqlite3.connect(RECORDATORIOS_DB)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS recordatorios ("
+        "chat_id INTEGER NOT NULL, num INTEGER NOT NULL, "
+        "texto TEXT NOT NULL, fin TEXT NOT NULL, "
+        "PRIMARY KEY (chat_id, num))"
+    )
+    return con
+
+
+def _rec_programar(chat_id: int, num: int, texto: str, delay_s: float) -> None:
+    tarea = asyncio.get_running_loop().create_task(
+        _rec_alertar(chat_id, num, texto, delay_s)
+    )
+    _RECORDARIO_TASKS[(chat_id, num)] = tarea
+
+
+async def _rec_alertar(chat_id: int, num: int, texto: str, delay_s: float) -> None:
+    try:
+        await asyncio.sleep(delay_s)
+    except asyncio.CancelledError:
+        return
+    _RECORDARIO_TASKS.pop((chat_id, num), None)
+    con = _rec_con()
+    con.execute("DELETE FROM recordatorios WHERE chat_id=? AND num=?", (chat_id, num))
+    con.commit()
+    con.close()
+    try:
+        await BOT_APP.bot.send_message(chat_id, "⏰ ¡RECORDATORIO!\n" + texto)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Recordatorio no entregado (chat %s, #%d): %s", chat_id, num, e)
+
+
+def _rec_agregar(chat_id: int, texto: str, minutos: int):
+    minutos = max(REC_MIN_MINUTOS, min(REC_MAX_MINUTOS, int(minutos)))
+    fin = datetime.now() + timedelta(minutes=minutos)
+    con = _rec_con()
+    fila = con.execute(
+        "SELECT MAX(num) FROM recordatorios WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+    num = (fila[0] or 0) + 1
+    con.execute(
+        "INSERT INTO recordatorios (chat_id, num, texto, fin) VALUES (?, ?, ?, ?)",
+        (chat_id, num, texto, fin.isoformat()),
+    )
+    con.commit()
+    con.close()
+    _rec_programar(chat_id, num, texto, minutos * 60)
+    return num, fin, minutos
+
+
+def _rec_listar(chat_id: int):
+    con = _rec_con()
+    filas = con.execute(
+        "SELECT num, texto, fin FROM recordatorios WHERE chat_id=? ORDER BY num",
+        (chat_id,),
+    ).fetchall()
+    con.close()
+    return filas
+
+
+def _rec_borrar(chat_id: int, num: int) -> bool:
+    con = _rec_con()
+    borradas = con.execute(
+        "DELETE FROM recordatorios WHERE chat_id=? AND num=?", (chat_id, num)
+    ).rowcount
+    con.commit()
+    con.close()
+    tarea = _RECORDARIO_TASKS.pop((chat_id, num), None)
+    if tarea:
+        tarea.cancel()
+    return borradas > 0
+
+
+async def _rec_restaurar(app) -> None:
+    global BOT_APP
+    BOT_APP = app
+    ahora = datetime.now()
+    con = _rec_con()
+    filas = con.execute("SELECT chat_id, num, texto, fin FROM recordatorios").fetchall()
+    programados, vencidos = 0, 0
+    for chat_id, num, texto, fin in filas:
+        try:
+            vencido = datetime.fromisoformat(fin)
+        except ValueError:
+            con.execute("DELETE FROM recordatorios WHERE chat_id=? AND num=?", (chat_id, num))
+            continue
+        delay = (vencido - ahora).total_seconds()
+        if delay <= 0:
+            con.execute("DELETE FROM recordatorios WHERE chat_id=? AND num=?", (chat_id, num))
+            vencidos += 1
+            continue
+        _rec_programar(chat_id, num, texto, delay)
+        programados += 1
+    con.commit()
+    con.close()
+    if filas:
+        log.info("Recordatorios restaurados: %d programados, %d vencidos descartados", programados, vencidos)
+
+
+async def _lex_extraer_recordatorio(peticion: str):
+    """Pide a Lex que prediga (texto, minutos) de una peticion en lenguaje libre."""
+    r = await client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": LEX_RECORDAR_SYSTEM + "\nMomento actual: "
+             + datetime.now().strftime("%A %d/%m/%Y %H:%M") + " (hora local)"},
+            {"role": "user", "content": peticion[:800]},
+        ],
+    )
+    crudo = (r.choices[0].message.content or "").strip()
+    m = LEX_RECORDAR_EXTRA.search(crudo)
+    if not m:
+        return None
+    try:
+        datos = json.loads(m.group(0))
+        texto = str(datos["texto"]).strip()
+        minutos = int(float(datos["minutos"]))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Prediccion de Lex no parseable: %s", e)
+        return None
+    if not texto or not minutos or minutos <= 0:
+        return None
+    return {"texto": texto, "minutos": minutos}
+
+
+def _rec_formato_restante(minutos: int) -> str:
+    return f"{minutos // 1440}d {minutos % 1440 // 60}h {minutos % 60}min"
+
+
+async def recordar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/recordar <asunto> [cuando]: crea un recordatorio (Lex interpreta el libre)."""
+    chat_id = update.effective_chat.id
+    consulta = " ".join(context.args or []).strip()
+    if not consulta:
+        await update.message.reply_text(
+            "⏰ Uso:\n"
+            "/recordar <mensaje> <n> <minutos|horas|dias>  (ej.: /recordar Comprar pan 30 minutos)\n"
+            "/recordar <mensaje libre con fecha/hora>  (ej.: /recordar ir al medico manana 9am — Lex lo interpreta)\n"
+            "/lista para verlos y /borrar <#> para cancelar."
+        )
+        return
+
+    m = re.search(r"(\d+)\s*(\w+)\s*$", consulta)
+    if m and m.group(2).lower() in UNIDADES_REM and consulta[: m.start()].strip():
+        num, fin, minutos = _rec_agregar(
+            chat_id, consulta[: m.start()].strip()[:500],
+            int(m.group(1)) * UNIDADES_REM[m.group(2).lower()],
+        )
+        await update.message.reply_text(
+            f"✅ ¡Listo! #{num} «{consulta[: m.start()].strip()}» "
+            f"en {_rec_formato_restante(minutos)}."
+        )
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    try:
+        prediccion = await _lex_extraer_recordatorio(consulta)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Lex no disponible para /recordar: %s", e)
+        prediccion = None
+    if not prediccion:
+        await update.message.reply_text(
+            "No logré interpretar el recordatorio. Prueba el formato clásico:\n"
+            "/recordar <mensaje> <n> <minutos|horas|dias>"
+        )
+        return
+    num, fin, minutos = _rec_agregar(chat_id, prediccion["texto"][:500], prediccion["minutos"])
+    await update.message.reply_text(
+        f"✅ Lex interpretó: #{num} «{prediccion['texto']}» "
+        f"en {_rec_formato_restante(minutos)}."
+    )
+
+
+async def lista_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lista: muestra los recordatorios pendientes de este chat."""
+    filas = _rec_listar(update.effective_chat.id)
+    if not filas:
+        await update.message.reply_text("No tienes recordatorios pendientes.")
+        return
+    ahora = datetime.now()
+    lineas = ["📋 Tus recordatorios:"]
+    for num, texto, fin in filas:
+        try:
+            faltan = max(0, int((datetime.fromisoformat(fin) - ahora).total_seconds() // 60))
+        except ValueError:
+            faltan = 0
+        lineas.append(f"{num}. {texto} — en {_rec_formato_restante(faltan)}")
+    lineas.append("\n/borrar <#> cancela uno.")
+    await update.message.reply_text("\n".join(lineas))
+
+
+async def borrar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/borrar <#>: cancela un recordatorio pendiente."""
+    consulta = (context.args or [""])[0].strip()
+    if not consulta.isdigit():
+        await update.message.reply_text("❌ Formato: /borrar <#> (ver /lista)")
+        return
+    if _rec_borrar(update.effective_chat.id, int(consulta)):
+        await update.message.reply_text(f"🗑️ Recordatorio {consulta} cancelado.")
+    else:
+        await update.message.reply_text("No existe ese recordatorio. Revisa /lista.")
+
+
+# ==================== fin RECORDATORIOS ====================
+
+
 async def _enviar(update: Update, texto: str, texto_usuario: str = ""):
     """Envia la respuesta (5 lineas) con la imagen mas a tono al mensaje."""
     tema = detectar_tema_respuesta(texto)
@@ -740,8 +981,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "comprometido con la defensa de la soberania de la Republica Bolivariana "
         "de Venezuela.\n\n"
         "Envame un texto, foto, video, voz o documento y lo analizare en 5 lineas.\n"
-        "Tambien puedo llevarte la biblioteca gratuita del Morral Digital.\n\n"
-        "Comandos: /ayuda  /libros  /imagen  /reiniciar"
+        "Tambien puedo llevarte la biblioteca gratuita del Morral Digital\n"
+        "y ponerte recordatorios (Lex los interpreta en lenguaje libre).\n\n"
+        "Comandos: /ayuda  /libros  /recordar  /lista  /imagen  /reiniciar"
     )
 
 
@@ -754,6 +996,10 @@ async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "(obras de dominio publico).\n"
         "/leer <titulo> - abre la fuente original del libro.\n"
         "/descargar <titulo> - te envia el PDF/EPUB del libro.\n"
+        "/recordar <mensaje> <n> <minutos|horas|dias> - crea un recordatorio.\n"
+        "/recordar <mensaje libre> - Lex interpreta cuándo avisarte "
+        "(ej.: /recordar reunion manana 9am).\n"
+        "/lista - tus recordatorios pendientes; /borrar <#> cancela uno.\n"
         "/imagen <tema> - envia una imagen de maduro, cilia_flores o comunas.\n"
         "/reiniciar - borra el historial de esta conversacion."
     )
@@ -831,10 +1077,17 @@ def _verificar_telegram_token():
 
 
 def main():
+    global BOT_APP
     cargar_indice()
     if not _verificar_telegram_token():
         return
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(_rec_restaurar)
+        .build()
+    )
+    BOT_APP = app
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ayuda", ayuda))
     app.add_handler(CommandHandler("help", ayuda))
@@ -843,6 +1096,9 @@ def main():
     app.add_handler(CommandHandler("libros", libros_cmd))
     app.add_handler(CommandHandler("leer", leer))
     app.add_handler(CommandHandler("descargar", descargar))
+    app.add_handler(CommandHandler("recordar", recordar_cmd))
+    app.add_handler(CommandHandler("lista", lista_cmd))
+    app.add_handler(CommandHandler("borrar", borrar_cmd))
     app.add_handler(CallbackQueryHandler(morral_callback, pattern=r"^mr:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, responder))
     app.add_handler(

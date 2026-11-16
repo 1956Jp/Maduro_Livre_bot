@@ -9,6 +9,10 @@ Bot de sátira política antichavista en Telegram, con dos caras:
   [El Morral Digital](https://1956jp.github.io/morral-digital/) — los usuarios
   pueden explorar la biblioteca, leer gratis los textos de enlace libre y
   reclamar las descargas de los títulos de pago desde el propio chat.
+- **Recordatorios persistentes**: crea avisos con `/recordar`; el formato
+  clásico se parsea sin IA y los pedidos en lenguaje libre los interpreta
+  Lex, que "predice" el asunto y los minutos que faltan. Sobreviven reinicios
+  (SQLite) y se reprograman al arrancar.
 
 ## Comandos
 
@@ -19,6 +23,9 @@ Bot de sátira política antichavista en Telegram, con dos caras:
 | `/libros` | Menú del catálogo: todas las obras o filtrar por corriente |
 | `/leer` | Solo las obras de lectura gratuita |
 | `/descargar` | Reclamar la descarga de un título de pago (requiere pedido `paid` en la tienda) |
+| `/recordar <mensaje> <n> <min\|horas\|dias>` | Crea un recordatorio (ej.: `/recordar Comprar pan 30 minutos`) |
+| `/recordar <mensaje libre>` | Lex interpreta cuándo avisarte (ej.: `/recordar reunion manana 9am`) |
+| `/lista` / `/borrar <#>` | Ver los recordatorios pendientes / cancelar uno |
 | `/image [tema]` | Publica una imagen satírica sobre un tema |
 
 Además responde a cualquier mensaje con la voz de Lex (LLM), y publica imágenes
@@ -74,6 +81,7 @@ reparar_ollama.sh       recuperación del runner de Ollama atascado
 ## Notas
 
 - Las imágenes proceden de Wikimedia Commons con licencias libres (PD/CC0/CC BY/CC BY-SA); los créditos por imagen están en `imagenes/<tema>/creditos.txt`.
+- Los recordatorios se guardan en `~/.local/share/maduro_bot/recordatorios.db`; al arrancar, el bot reprograma los pendientes y descarta los vencidos.
 - Sátira política sobre figuras públicas: el bot no representa ni se hace pasar por persona real.
 - Integración con El Morral Digital: consulta el catálogo público del sitio (con respaldo local) y la entrega de títulos de pago se realiza mediante URLs firmadas de la Edge Function de Supabase, solo tras verificar el pedido.
 - No subas nunca `.env` (contiene tu token y claves). El `.gitignore` lo bloquea.
